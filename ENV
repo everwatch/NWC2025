@@ -1,0 +1,178 @@
+#!/bin/bash
+
+declare -A myVar
+myVar[Name]="servicedesc"
+myVar[myDelim]="[ :]"
+
+declare -A myOptions
+
+do_help() {
+cat << HELP_EOF
+This utility is designed to be called by the ARGx parameters of a Nagios configuration as one of the following:
+  \$\$(\$USER1\$/env [-n <var>] [-T <var2>] [-t <default>] [-f|-F <field>] [-d <delim>] [-g|-s <val>] [-u|-l] [-v]
+  \$\$(\$USER1\$/env [-NT] [-NP] [-HT|-ST|-CT suffix]
+  -H|-S|-C will cause var to be of type NAGIOS__<HOST|SERVICE|CONTACT><var> and then continue with normal processing
+  Use --pre <prefix> and --post <postfix> to add prefix/postfix to the output string after all other processing has completed, but only if not blank.
+
+Where:
+  var     the name of a case-insensitive NAGIOS_variable (defaults to "servicedesc")
+  default a default value if \$NAGIOS_var\$ is blank (case sensitive)
+  field   an awk-compatible field number (potentially to use with <delim>) (see below)
+  delim   an awk-compatible field delimiter (defaults to space and colon)
+  -T	  if var returns blank, try vars as NAGIOS___HOSTvar2 before applying -t as a default
+	Example: svc="HTTP: 8080" and $0 -T HTTPPORT -t 80 -f -1 --num will return 8080 but "svc: HTTP" will return NAGIOS__HTTPPORT if exists, or 80 if not
+  -u      Convert the output to uppercase
+  -l	  Convert the output to lowercase
+  -p      Convert / to | (mainly for disk names in NCPA checks)
+  suffix  Take var result and use the it to get NAGIOS__[HOST|SERVICE|CONTACT]<result><suffix>
+  -v      Be verbose (only for debugging)
+  -g      Returns "val" if "val" appears anywhere in the value of var (basically, a grep) and then continues processing as normal
+  -s	  The result must match this value or else it will return blank
+  --num   The result will have all non-numbers stripped from it
+  -NP     Returns NAGIOS__HOSTNCPAPORT (implied default of 5693)
+  -NT     Look for NAGIOS__HOSTNCPA<suffix> (defaults to TOKEN)
+	Can do double lookup if -HT is specified directly: -HT TOKEN will find NAGIOS__HOSTNCPATOKEN=Level1 which then finds NAGIOS__HOSTLEVEL1TOKEN=Secret
+	Or -HT PASS will find NAGIOS__HOSTNCPAPASS=Level2 which will then find NAGIOS__HOSTLEVEL2PASS=SuperSecret
+
+The value will always be trimmed of leading and/or trailing spaces/tabs.
+
+If -f is used, then the result will be as if the request were as follows, unless the field starts with a negative, in which case it will read from the last word forward:
+  echo \$NAGIOS_var\$ | awk -F <delim> '{print $<field>}'
+If -F is used, -d is forced to " " and the field number reflects is the first, second, or third of the last three fields
+  Ex: Disk check on / 80 90		With -F 1=/, -F 2=80, -F 3=90
+
+Examples (service_description is assumed to be "MySQL Check: myDatabase performance"):
+  $0 				Return: "MySQL Check: myDatabase performance"
+  $0 -n hostName			Return: "localhost" (or whatever the name of the host is that ran the check)
+  $0 -n SERVICESTATE -t 0		Return: current state of the service (0, 1, 2) or 0 if the state is not defined
+  $0 -n servicedesc -f 2		Return: "Check" (watch out for defaults!)
+  $0 -n servicedesc -f 4		Return: "myDatabase" (watch out for defaults!)
+  $0 -n servicedesc -d : -f 2	Return: "myDatabase performance"
+  $0 -n servicedesc -d : -f -2 	Return: "MySQL Check" (2nd field from right, split by :)*
+  $0 -n servicedesc -f -2 -HT pass	Return: the value of \$NAGIOS__HOSTNAGIOSXIPASS\$
+
+see https://assets.nagios.com/downloads/nagioscore/docs/nagioscore/4/en/macrolist.html for possible macro names.
+*0 for this field will print the entire line
+HELP_EOF
+  exit
+}
+
+while [ -n "$1" ]; do
+  case "$1" in
+    -h|--help) do_help;;
+    -n) myVar[Name]="$2"; shift 2;;
+    -T) myVar[HostVar]="$2"; shift 2;;
+    -t) myVar[Default]="$2"; shift 2;;
+    -d) myVar[myDelim]="$2"; shift 2;;
+    -f) myVar[myField]="$2"; shift 2;;
+    -F) myVar[myDelim]=" "; myVar[myField]=$(($2-4)); shift 2;;
+    -HT) myVar[myHT]="$2"; shift 2;;
+    -ST) myVar[myST]="$2"; shift 2;;
+    -CT) myVar[myCT]="$2"; shift 2;;
+    -g) myVar[myGrep]="$2"; shift 2;;
+    -s) myVar[myString]="$2"; shift 2;;
+    --pre) myVar[myPrefix]="$2"; shift 2;;
+    --post) myVar[myPostfix]="$2"; shift 2;;
+    --num) myOptions[doNumber]="true"; shift 1;;
+    -NT) myOptions[doNCPA]="true"; shift 1;;
+    -NP) myVar[Name]="NAGIOS__HOSTNCPAPORT"; myVar[Default]="5693"; shift 1;;
+    -H) myOptions[doHost]="true"; shift 1;;
+    -S) myOptions[doService]="true"; shift 1;;
+    -C) myOptions[doContact]="true"; shift 1;;
+    -p) myOptions[doPipe]="true"; shift 1;;
+    -u) myOptions[doUpper]="true"; shift 1;;
+    -l) myOptions[doLower]="true"; shift 1;;
+    -v) myOptions[doVerbose]="true"; shift 1;;
+    *) shift 1;;
+  esac
+done
+
+do_debug() {
+  [ -n "${myOptions[doVerbose]}" ] && echo "### DEBUG: $1"
+}
+
+do_lookup() {
+  var="$1"; def="$2"
+  val=${!var:-$def}
+  echo "$val"
+}
+
+do_output() {
+  val="$1"
+  [ -z "$val" ] && return
+  echo "${myVar[myPrefix]}${val}${myVar[myPostfix]}"
+}
+
+if [ -n "${myOptions[doNCPA]}" ]; then
+  do_debug "NCPA mode active. myVar[myHT]}=${myVar[myHT]}"
+  myVar[Name]=`echo "NAGIOS__HOSTNCPA${myVar[myHT]:-token}" | tr "a-z" "A-Z"`
+else
+  do_debug "NCPA mode NOT active."
+  do_debug "myOptions[doHost]=${myOptions[doHost]} myOptions[doService]=${myOptions[doService]} myOptions[doContact]=${myOptions[doContact]}"
+  [ -n "${myOptions[doHost]}" ] && myVar[Name]="_HOST${myVar[Name]}"
+  [ -n "${myOptions[doService]}" ] && myVar[Name]="_SERVICE${myVar[Name]}"
+  [ -n "${myOptions[doContact]}" ] && myVar[Name]="_CONTACT${myVar[Name]}"
+  myVar[Name]=`echo "NAGIOS_${myVar[Name]}" | tr "a-z" "A-Z"`
+fi
+
+do_debug "1: Looking for ${myVar[Name]}..."
+myVar[Value]=`do_lookup "${myVar[Name]}"`
+do_debug "2: Got myVar[Value]=${myVar[Value]}"
+
+# if -g was specified, then only return the portion of the result that matches
+if [ -n "${myVar[myGrep]}" ]; then
+  do_debug "1: grepping ${myVar[Name]} for ${myVar[myGrep]}"
+  myVar[Value]=`echo "${myVar[Value]}" | egrep -o -- "${myVar[myGrep]}"`
+fi
+
+if [ -n "${myVar[myField]}" ]; then
+  do_debug "myVar[myField]=${myVar[myField]}"
+  if [ "${myVar[myField]}" -lt 0 ]; then
+    myVar[Value]=`echo "${myVar[Value]}" | rev | awk -F "${myVar[myDelim]}" -v f="${myVar[myField]:1}" '{print $f}' | rev`
+  else
+    myVar[Value]=`echo "${myVar[Value]}" | awk -F "${myVar[myDelim]}" -v f="${myVar[myField]}" '{print $(f)}'`
+  fi
+fi
+myVar[Value]=`echo ${myVar[Value]} | sed -e "s/^[ \t]*//" -e "s/[ \t]*$//"`
+do_debug "3: After processing myVar[Value]=${myVar[Value]}"
+
+[ -n "${myOptions[doUpper]}" ] && myVar[Value]=`echo "${myVar[Value]}" | tr "a-z" "A-Z"`
+[ -n "${myOptions[doLower]}" ] && myVar[Value]=`echo "${myVar[Value]}" | tr "A-Z" "a-z"`
+
+# Check for myHT
+if [ -n "${myVar[myHT]}" ]; then
+  myVar[myHT]=`echo "NAGIOS__HOST${myVar[Value]}${myVar[myHT]}" | tr "a-z" "A-Z"`
+  do_debug "4: myVar[myHT]=${myVar[myHT]}"
+  myVar[Value]=`do_lookup ${myVar[myHT]}`
+fi
+
+# Check for myST
+if [ -n "${myVar[myST]}" ]; then
+  myVar[myST]=`echo "NAGIOS__SERVICE${myVar[Value]}${myVar[myST]}" | tr "a-z" "A-Z"`
+  do_debug "4: myVar[myST]}=${myVar[myST]}"
+  myVar[Value]=`do_lookup ${myVar[myST]}`
+fi
+
+# Check for myCT
+if [ -n "${myVar[myCT]}" ]; then
+  myVar[myCT]=`echo "NAGIOS__CONTACT${myVar[Value]}${myVar[myCT]}" | tr "a-z" "A-Z"`
+  do_debug "4: myVar[myCT]=${myVar[myCT]}"
+  myVar[Value]=`do_lookup "${myVar[myCT]}"`
+fi
+
+[ -n "${myVar[myString]}" -a "${myVar[myString]}" != "${myVar[Value]}" ] && myVar[Value]=""
+[ -n "${myOptions[doNumber]}" ] && myVar[Value]=`echo ${myVar[Value]} | tr -d -c "0-9"`
+[ -n "${myOptions[doPipe]}" ] && myVar[Value]=`echo ${myVar[Value]} | tr "/" "|"`
+
+do_debug "About to check for -T options because myVar[Value]=${myVar[Value]}"
+if [ -z "${myVar[Value]}" ]; then
+  do_debug "myVar[Value] is blank, checking for ${myVar[HostVar]}"
+  myVar[Value]=`do_lookup "NAGIOS__HOST${myVar[HostVar]}"`
+  do_debug "received ${myVar[Value]}"
+  [ -z "${myVar[Value]}" ] && myVar[Value]="${myVar[Default]}"
+fi
+
+# Print the result
+do_output "${myVar[Value]}"
+
+exit 0

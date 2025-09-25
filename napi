@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+
+APIkeyFile=".nagiosapikey"
+[ ! -r "$APIkeyFile" ] && APIkeyFile="${HOME}/.nagiosapikey"
+[ ! -r "$APIkeyFile" ] && APIkeyFile=""
+
+APIKEY=""
+XI_URL=""
+curl="curl -k -s"
+
+# myDir (for "Directives") are now too big for individual variables.  We'll read them into an associative array instead
+declare -A myDir
+
+# We need a separate thing for myOptions and it's easier to have a couple of them be straight variables
+declare -A myOptions
+myOptions[API]="objects"
+myOptions[APIep]="servicestatus"
+verbose="0"
+tmpJSON=""
+tmpQuick=""
+tmpQuicker=""
+
+# Different API commands return different JSON datasets.  So let's make a lookup table that figures out where to start the data extracts
+declare -A APIinfo
+APIinfo["objects/host"]=".host[]"
+APIinfo["objects/hoststatus"]=".hoststatus[]"
+APIinfo["objects/servicestatus"]=".servicestatus[]"
+APIinfo["system/user"]=".users[]"
+
+do_debug() {
+  [ "$verbose" -ge "$1" ] && echo "$2" >&2
+}
+
+get_myAPI() {
+  case "$1" in
+    o*) myOptions[API]="objects";;
+    *)  myOptions[API]="";;
+  esac
+}
+
+get_myAPIep() {
+  case "$1" in
+    h|host) myOptions[APIep]="host";;
+    hs|hoststatus) myOptions[APIep]="hoststatus";;
+    s|service) myOptions[APIep]="service";;
+    ss|servicestatus) myOptions[APIep]="servicestatus";;
+    u|user) myOptions[APIep]="user";;
+    *) myOptions[APIep]="";;
+  esac
+}
+
+print_help() {
+  cat << HELP_EOF
+    --api	< o*bjects | c*onfig | s*ystem >
+    -t|--object	< hoststatus | servicestatus | logentries | statehistory | uo | ...
+    --url	XI_URL=<value>
+
+    --ace	active_checks_enabled=<0,1>
+    -c|--command	check_command=<value>
+    -f|--fields	JQ-valid list of fields to show=<value>
+    --file	load JSON from=<value>
+    --help	This text
+    -h|--host	host_name=<value>
+    -j|--jq	additional valid JQ=<value>
+    --key	APIKEY=<value>
+    --keyfile	APIkeyFile=<value>
+    --output	output text=<value>
+    -Q|--quick	Sets -f to .host_name,.service_description,.current_state,.state_type,.problem_has_been_acknowledged (assumes servicestatus)
+    -q		Same as --quick but add -o c
+    -qq		Same as --quick but add -o c but also print the first line of the CSV output (fields)
+    --save	save JSON to=<value>
+    -s|--service	service_description=<value>
+    --users	Lists XI users
+    --usersa	Lists XI users (advanced)
+    --status	Quick select for showing similar things that you would see on main servicestatus page in the GUI
+    --bstatus	Same as --status but only show things that are not in an OK state
+    --hstatus	Quick select for showing similar things that you would see on a main hoststatus page in the GUI
+    --bhstatus	Same as --hstatus but only show things that are not in an OK state
+    --state	0, 1, or 2 (or other, I suppose)
+    --stype	0, 1 (SOFT or HARD)
+    -v|--verbose	verbose=\$((\$verbose + 1))
+HELP_EOF
+  exit
+}
+
+# get_opts
+while [ -n "$1" ]; do
+  case "$1" in
+    --help) print_help;;
+    --key) APIKEY="$2"; shift 2;;
+    --keyfile) APIkeyFile="$2"; shift 2;;
+    --url) XI_URL="$2"; shift 2;;
+    -v|--verbose) verbose=$(($verbose + 1)); shift 1;;
+    --api) get_myAPI "$2"; shift 2;;
+    -t|--object) get_myAPIep "$2"; shift 2;;
+    --ack) myDir[problem_has_been_acknowledged]="$2"; shift 2;;
+    --ace) myDir[active_checks_enabled]="$2"; shift 2;;
+    -c|--command) myDir[check_command]="$2"; shift 2;;
+    -D) myDir[$2]="$3"; shift 3;;
+    -h|--host) myDir[host_name]="$2"; shift 2;;
+    --output) myDir[output]="$2"; shift 2;;
+    -s|--service) myDir[service_description]="$2"; shift 2;;
+    --state) myDir[current_state]="$2"; shift 2;;
+    --stype) myDir[state_type]="$2"; shift 2;;
+    --ctrace) myOptions[CommandTrace]="true"; shift 1;;
+    --delete) myOptions[Delete]="true"; shift 1;;
+    --users) myOptions[Users]="0"; shift 1;;
+    --usersa) myOptions[Users]="1"; shift 1;;
+    --useradd) myOptions[UserAdd]="$2"; shift 2;;
+    --userdel) myOptions[UserDel]="$2"; shift 2;;
+    -f|--fields) myOptions[Fields]="$2"; shift 2;;
+    --file) myOptions[File]="$2"; shift 2;;
+    -j|--jq) myOptions[MoreJQ]="$2"; shift 2;;
+    -o|--opt) myOptions[Options]+="$2,"; shift 2;;
+    --order) myOptions[OrderBy]="$2"; shift 2;;
+    -q) myOptions[Quick]="true"; myOptions[Options]+="c,"; shift 1;;
+    -qq) myOptions[Quick]="true"; myOptions[Options]+="c,C,"; shift 1;;
+    -Q|--quick) myOptions[Quick]="true"; shift 1;;
+    --save) myOptions[Save]="$2"; shift 2;;
+    --status) myOptions[Status]="true"; shift 1;;
+    --hstatus) myOptions[HStatus]="true"; shift 1;;
+    --bstatus) myOptions[Status]="true"; myOptions[BStatus]="true"; shift 1;;
+    --bhstatus) myOptions[HStatus]="true"; myOptions[BHStatus]="true"; shift 1;;
+    --raw) myOptions[Raw]="true"; shift 1;;
+    *) shift 1;;
+  esac
+done
+
+# Fix things that are impossible to call
+[ "${myOptions[API]}" = "config" -a "${myOptions[APIep]}" = "servicestatus" ] && myOptions[APIep]="service"
+[ "${myOptions[API]}" = "config" -a "${myOptions[APIep]}" = "hoststatus" ] && myOptions[APIep]="host"
+
+# If we're doing status mode, then override a bunch of other options
+if [ -n "${myOptions[Status]}" ]; then
+  myOptions[API]="objects"
+  myOptions[APIep]="servicestatus"
+  myOptions[Options]=""
+  myOptions[Quick]="true"
+  myOptions[Options]+="c,X,"
+  # If we did a bstatus, then we only want things that are bad
+  if [ -n "${myOptions[BStatus]}" ]; then
+    myDir[current_state]="[^0]"
+  fi
+fi
+if [ -n "${myOptions[HStatus]}" ]; then
+  myOptions[API]="objects"
+  myOptions[APIep]="hoststatus"
+  myOptions[Options]=""
+  myOptions[Quick]="true"
+  myOptions[Options]+="c,X,"
+  # If we did a bstatus, then we only want things that are bad
+  if [ -n "${myOptions[BHStatus]}" ]; then
+    myDir[current_state]="[^0]"
+  fi
+fi
+
+# If we're listing users, then set things accordingly
+if [ -n "${myOptions[Users]}" ]; then
+  myOptions[API]="system"
+  myOptions[APIep]="user"
+fi
+
+# Get our API key
+if [ -n "$APIkeyFile" -a -r "$APIkeyFile" ]; then
+  do_debug 1 "Looking for url=$url in $APIkeyFile"
+  while read url key; do
+    if [ -z "$XI_URL" ]; then
+      XI_URL="$url"
+      APIKEY="$key"
+      do_debug 1 "Found url=$url key=$key"
+      break
+    fi
+    do_debug 2 "-> Looking for url=$url XI_URL=$XI_URL"
+    if [[ "$url" =~ "$XI_URL" ]]; then
+      XI_URL="$url"
+      APIKEY="$key"
+    fi
+  done < "$APIkeyFile"
+fi
+do_debug 1 "Final URL=$XI_URL and key=$APIKEY"
+[ -z "$XI_URL" -o -z "$APIKEY" ] && echo "Empty URL or Key." && exit
+
+do_api() {
+  api_start="$1"
+  api_command="$2"
+  url="${XI_URL}/api/v1/${api_start}/${api_command}?pretty=0&apikey=${APIKEY}"
+  [ -n "${myOptions[OrderBy]}" ] && url+="&orderby=${myOptions[OrderBy]}"
+  [ "${myOptions[Users]}" == "1" ] && url+="&advanced=1"
+  do_debug 2 "start=$1 command=$2"
+  $curl -XGET -k "$url"
+}
+
+# Grab a copy of the JSON data so we don't have to keep making calls over and over
+# If we used an existing file, then just use that
+if [ -z "${myOptions[File]}" ]; then
+  tmpJSON=`mktemp`
+  do_debug 1 "tmp file is $tmpJSON"
+  do_debug 2 "  myAPI is ${myOptions[API]} and myAPIep is ${myOptions[APIep]}"
+  do_api "${myOptions[API]}" "${myOptions[APIep]}" > $tmpJSON
+else
+  do_debug 1 "myFile=${myOptions[File]}"
+  tmpJSON="${myOptions[File]}"
+  do_debug 1 "tmpJSON=$tmpJSON"
+fi
+
+# if mySave is not empty, then we're just saving it into the file called ${myOptions[Save]}
+if [ -n "${myOptions[Save]}" ]; then
+  mv $tmpJSON ${myOptions[Save]}
+  do_debug 1 "JSON data saved to ${myOptions[Save]}"
+  exit
+fi
+
+# Helper functions for creating our jqString
+# First, we need to know if our tests should be case-sensitive or not
+jq_check_case() {
+  thing="$*"
+  do_debug 1 "### JQ_CHECK_CASE looking for thing=$thing"
+  if [ -n "$thing" ]; then
+    do_debug 2 "### in JQ_CHECK_CASE cmdOptions=${myOptions[Options]}"
+    val="| test(\"$thing\""
+    [[ "${myOptions[Options]}" =~ "i," ]] && val+="; \"i\""
+    echo "$val)"
+  else
+    echo ""
+  fi
+}
+  
+# Create the jQuery search string
+jq_get_fields() {
+  [[ "${myOptions[Options]}" =~ "c," ]] && jqString+="| [${myOptions[Fields]}] | @csv" || jqString+="| ${myOptions[Fields]}"
+}
+
+# Otherwise, let's parse the JSON data here
+# Parse our string
+do_debug 1 "APIinfo=${APIinfo[${myOptions[API]}/${myOptions[APIep]}]}"
+jqString=${APIinfo[${myOptions[API]}/${myOptions[APIep]}]}
+do_debug 2 "  Before: jqString=$jqString"
+for thing in "${!myDir[@]}"; do
+  [ -n "${myDir[$thing]}" ] && jqString+="| select(.$thing $(jq_check_case ${myDir[$thing]}))"
+  do_debug 2 "    During: jqString=$jqString"
+done
+do_debug 2 "  After: jqString=$jqString"
+
+# endpoint specific things
+case "${myOptions[API]}/${myOptions[APIep]}" in
+  objects/hoststatus) tmpQuick=".host_name,.address,.current_state,.state_type,.last_check,.current_check_attempt,.normal_check_interval,.retry_check_interval,.max_check_attempts,.check_command";
+	tmpQuicker="Host,Address,State,Type,Last Check,Attempt,Normal,Retry,Max,Command";;
+  objects/servicestatus) tmpQuick=".service_description,.host_name,.current_state,.state_type,.last_check,.current_check_attempt,.normal_check_interval,.retry_check_interval,.max_check_attempts,.output";
+	tmpQuicker="Service,Host,State,Type,Last Check,Attempt,Normal,Retry,Max,Output";;
+esac
+
+do_debug 1 "myOptions[Options]=${myOptions[Options]}"
+if [ -n "${myOptions[Quick]}" -a -n "${myOptions[Fields]}" ]; then
+  myOptions[Fields]="$tmpQuick,${myOptions[Fields]}"
+elif [ -n "${myOptions[Quick]}" ]; then
+  myOptions[Fields]="$tmpQuick"
+fi
+[[ ${myOptions[Options]} =~ "C," ]] && echo "${myOptions[Fields]}"
+[[ ${myOptions[Options]} =~ "X," ]] && echo "$tmpQuicker" && printf '%*s\n' "${COLUMNS:-$(tput cols)}" '' | tr ' ' -
+do_debug 1 "myOptions[Fields]=${myOptions[Fields]}"
+[ -n "${myOptions[Fields]}" ] && jq_get_fields
+jqString+="${myOptions[MoreJQ]}"
+do_debug 1 "jqString=$jqString"
+
+if [ -n "${myOptions[Raw]}" ]; then
+  do_debug 1 "*** RAW specified *** Overriding all other options"
+  cat $tmpJSON
+else
+  cat $tmpJSON | jq -r "$jqString"
+fi
+[ -z "${myOptions[File]}" ] && rm $tmpJSON
+
+exit
